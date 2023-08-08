@@ -1,0 +1,288 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Instance and EBS volume cleanup Lambda for AWS Accounts - 1.0.0
+
+Parameters:
+  InstanceMaxAge:
+    Type: Number
+    Default: 0
+    Description: Enter a maximum age (in days) that instances can reach before being deleted. Enter 0 to disable automatic deletion.
+  EBSMaxAge:
+    Type: Number
+    Default: 0
+    Description: Enter a maximum age (in days) that EBS volumes can reach before being deleted. Enter 0 to disable automatic deletion.
+  IsDryRun:
+    Type: String
+    AllowedValues:
+      - true
+      - false
+    Default: true
+    Description: Enter true or false. Default is true.
+  EnableSchedule:
+    Type: String
+    AllowedValues:
+      - ENABLED
+      - DISABLED
+    Default: DISABLED
+
+Resources:
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Role: !GetAtt LambdaExecutionRole.Arn
+      FunctionName: !Sub '${AWS::StackName}-lambda'
+      Environment:
+        Variables:
+          EC2_MAXAGE: !Ref InstanceMaxAge
+          IS_DRY_RUN: !Ref IsDryRun
+          EBS_MAXAGE: !Ref EBSMaxAge
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import logging
+          import datetime
+          from datetime import datetime,timezone
+          from botocore.exceptions import ClientError
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          ec2client = boto3.client('ec2', region_name='us-east-1')
+
+          def get_volumes():
+              all_volumes = ec2client.describe_volumes(
+                  Filters=[
+                      {
+                          'Name': 'status',
+                          'Values': [
+                              'available',
+                          ]
+                      },
+                  ],
+              )
+              return all_volumes
+
+          def terminate_volumes(all_volumes):
+              max_age = int(os.environ['EBS_MAXAGE'])
+              dry_run = str(os.environ['IS_DRY_RUN'])
+              if max_age == 0:
+                  logger.info(f"Volume deletion is disabled. No action was taken.")
+              else:
+                  if dry_run == "true":
+                      logger.info(f"Dry Run enabled. No volumes will be deleted.")
+                  else:
+                      logger.info(f"Dry Run not enabled. Proceeding with volume deletion.")
+                  for volumes in all_volumes['Volumes']:
+                      volume = volumes['VolumeId']
+                      create_time = str(volumes['CreateTime'])
+                      volume_age = datetime.strptime(create_time, "%Y-%m-%d %H:%M:%S.%f%z")
+                      diff = datetime.now(timezone.utc) - volume_age
+                      if diff.days > max_age:
+                          if dry_run == "false":
+                              try:
+                                  response = ec2client.delete_volume(
+                                      VolumeId = volume
+                                  )
+                                  logger.info("Volume ID " + volume + " was deleted at " + str(diff.days) + " days old.")
+                              except ClientError as err:
+                                  logger.error(f"{err}")
+                                  logger.error("Volume ID " + volume + " could not be terminated because of error: " + str(err))
+                          else:
+                              if diff.days > max_age:
+                                  logger.info("Volume ID " + volume + " would be deleted because it is " + str(diff.days) + " days old.")
+                      else:
+                          logger.info("Volume ID " + volume + " is not past max age. It is currently " + str(diff.days) + " days old.")
+
+          def get_instances():
+              all_instances = ec2client.describe_instances(
+                  Filters=[
+                      {
+                          'Name': 'instance-state-name',
+                          'Values': [
+                              'running', 'stopped', 'stopping', 'shutting-down'
+                          ]
+                      },
+                  ],
+              )['Reservations']
+              return all_instances
+
+          def terminate_instances(all_instances):
+              max_age = int(os.environ['EC2_MAXAGE'])
+              dry_run = str(os.environ['IS_DRY_RUN'])
+              if max_age == 0:
+                  logger.info(f"Instance termination is disabled. No action was taken.")
+              else:
+                  if dry_run == "true":
+                      logger.info(f"Dry Run enabled. No instances will be terminated.")
+                  else:
+                      logger.info(f"Dry Run not enabled. Proceeding with instance termination.")
+                  for instances in all_instances:
+                      instance = instances['Instances'][0]
+                      instance_id = instance['InstanceId']
+                      launch_time = str(instance['LaunchTime'])
+                      instance_age = datetime.strptime(launch_time, "%Y-%m-%d %H:%M:%S%z")
+                      diff = datetime.now(timezone.utc) - instance_age
+                      if diff.days > max_age:
+                          if dry_run == "false":
+                              try:
+                                  response = ec2client.terminate_instances(
+                                      InstanceIds=[
+                                          instance_id,
+                                      ]
+                                  )
+                                  logger.info("Instance ID " + instance_id + " was terminated at " + str(diff.days) + " days old.")
+                              except ClientError as err:
+                                  logger.error(f"{err}")
+                                  logger.error("Instance ID " + instance_id + " could not be terminated because of error: " + str(err))
+                          else:
+                              if diff.days > max_age:
+                                  logger.info("Instance ID " + instance_id + " would be terminated because it is " + str(diff.days) + " days old.")
+                      else:
+                          logger.info("Instance ID " + instance_id + " is not past max age. It is currently " + str(diff.days) + " days old.")
+
+          def lambda_handler(event, context):
+              all_instances = get_instances()
+              terminate_instances(all_instances)
+              all_volumes = get_volumes()
+              terminate_volumes(all_volumes)
+      Description: Cleans up old instances and EBS volumes that are no longer being used.
+      MemorySize: 128
+      Handler: index.lambda_handler
+      Timeout: 600
+      Runtime: python3.9
+
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${LambdaFunction}"
+      RetentionInDays: 60
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: LambdaPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: "InstanceUpdatePermissions"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:ec2:*:${AWS::AccountId}:instance/*"
+                Effect: Allow
+                Action:
+                  - ec2:TerminateInstances
+              - Sid: "InstanceGetPermissions"
+                Resource: "*"
+                Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:DescribeVolumes
+              - Sid: "EBSTerminatePermissions"
+                Resource: "*"
+                Effect: Allow
+                Action:
+                  - ec2:DeleteVolume
+              - Sid: "WriteLogPermissions"
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:*"
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+
+  CleanupLambdaSchedule:
+    Type: AWS::Events::Rule
+    Properties: 
+      Description: "LambdaScheduleRule"
+      ScheduleExpression: cron(0 0 * * ? *)
+      State: !Ref EnableSchedule
+      Targets: 
+        - 
+          Arn:
+            Fn::GetAtt:
+              - "LambdaFunction"
+              - "Arn"
+          Id: LambdaFunction
+
+  PermissionForEventsToInvokeLambda: 
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: !Ref "LambdaFunction"
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: 
+        Fn::GetAtt: 
+          - CleanupLambdaSchedule
+          - Arn
+
+  CloudWatchAlarmSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${AWS::StackName}-Monitor"
+
+  CloudWatchAlarmSNSTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref CloudWatchAlarmSNSTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Id: SSEAndSSLPolicy
+        Statement:
+          - Sid: Allow_Publish_Alarms
+            Effect: Allow
+            Principal:
+              Service:
+                - cloudwatch.amazonaws.com
+            Action: sns:Publish
+            Resource:
+              - !Join
+                - ':'
+                - - 'arn'
+                  - !Ref AWS::Partition
+                  - 'sns'
+                  - !Ref AWS::Region
+                  - !Ref AWS::AccountId
+                  - !GetAtt CloudWatchAlarmSNSTopic.TopicName
+
+  FailedMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties: 
+      LogGroupName: !Ref LambdaLogGroup
+      FilterPattern: >- 
+        "[ERROR]"
+      MetricTransformations:
+        - MetricValue: '1'
+          DefaultValue: '0'
+          MetricNamespace: LambdaMetrics
+          MetricName: LambdaFailures
+
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-Monitor"
+      AlarmDescription: >-
+        A CloudWatch Alarm that triggers if there are errors returned from the Lambda
+      MetricName: LambdaFailures
+      Namespace: LambdaMetrics
+      Statistic: Sum
+      Period: '300'
+      EvaluationPeriods: '1'
+      Threshold: '1'
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - Ref: CloudWatchAlarmSNSTopic
+      TreatMissingData: notBreaching
+
+Outputs:
+  LambdaFunction:
+    Value: !Ref LambdaFunction
